@@ -1,335 +1,212 @@
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord import app_commands
-from datetime import datetime, timezone, timedelta
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ==================== НАСТРОЙКИ ====================
 TOKEN = os.getenv("DISCORD_TOKEN")
-MSK = timezone(timedelta(hours=3))
 
-# Цвета
-COLOR_ACTIVE = 0x00FF9F      # Неоновый зелёный
-COLOR_WARNING = 0xFFAA00     # Оранжевый (когда < 1 часа)
-COLOR_CRITICAL = 0xFF3355    # Красный (когда < 10 минут)
-COLOR_SUCCESS = 0x00FF88     # Успех
-COLOR_ERROR = 0xFF4444
-
-# Эмодзи
-EMOJI_TIMER = "⏳"
-EMOJI_ROCKET = "🚀"
-EMOJI_FIRE = "🔥"
-EMOJI_CLOCK = "🕒"
-EMOJI_CHECK = "✅"
-EMOJI_STOP = "🛑"
+# ==================== НАСТРОЙКИ ====================
+# ID ролей, которым разрешено выдавать/забирать роли
+ALLOWED_ROLE_IDS = {
+    1512321611884396665,
+    1500474195211980980,
+    1557799401072890017,
+}
 
 intents = discord.Intents.default()
+intents.members = True
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Хранилище активных таймеров
-# {channel_id: {"end_time": datetime, "message": Message, "title": str, "started_by": str}}
-active_timers: dict[int, dict] = {}
+
+# ==================== ПРОВЕРКА ПРАВ ====================
+
+def has_allowed_role():
+    """Проверяет, есть ли у пользователя одна из разрешённых ролей"""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if interaction.user.id == interaction.guild.owner_id:
+            return True  # владелец сервера всегда может
+        
+        user_role_ids = {role.id for role in interaction.user.roles}
+        return bool(user_role_ids & ALLOWED_ROLE_IDS)
+    
+    return app_commands.check(predicate)
 
 
-def format_time_left(td: timedelta) -> str:
-    """Красивое форматирование оставшегося времени"""
-    total = max(0, int(td.total_seconds()))
-    days, rem = divmod(total, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-
-    parts = []
-    if days > 0:
-        parts.append(f"**{days}**д")
-    if hours > 0 or days > 0:
-        parts.append(f"**{hours}**ч")
-    if minutes > 0 or hours > 0 or days > 0:
-        parts.append(f"**{minutes}**м")
-    parts.append(f"**{seconds}**с")
-
-    return " ".join(parts)
-
-
-def create_progress_bar(percent: float, length: int = 16) -> str:
-    """Создаёт текстовый прогресс-бар"""
-    filled = int(percent * length)
-    empty = length - filled
-    bar = "█" * filled + "░" * empty
-    return f"`{bar}` {int(percent * 100)}%"
-
-
-def get_color(remaining: timedelta) -> int:
-    """Выбирает цвет в зависимости от оставшегося времени"""
-    total = remaining.total_seconds()
-    if total <= 600:      # < 10 минут
-        return COLOR_CRITICAL
-    elif total <= 3600:   # < 1 часа
-        return COLOR_WARNING
-    return COLOR_ACTIVE
-
-
-def build_embed(
-    title: str,
-    end_time: datetime,
-    remaining: timedelta,
-    started_by: str | None = None,
-    start_time: datetime | None = None
-) -> discord.Embed:
-    """Создаёт красивый embed"""
-    color = get_color(remaining)
-    time_str = format_time_left(remaining)
-    timestamp = int(end_time.timestamp())
-
-    # Прогресс-бар
-    progress_line = ""
-    if start_time:
-        total = (end_time - start_time).total_seconds()
-        if total > 0:
-            elapsed = total - remaining.total_seconds()
-            progress = max(0.0, min(1.0, elapsed / total))
-            progress_line = f"\n{create_progress_bar(progress, 18)}\n"
-
-    embed = discord.Embed(
-        title=f"{EMOJI_TIMER}  {title}",
-        description=(
-            f"### Осталось\n"
-            f"# {time_str}\n"
-            f"{progress_line}"
-        ),
-        color=color,
-        timestamp=datetime.now(timezone.utc)
-    )
-
-    embed.add_field(
-        name=f"{EMOJI_CLOCK} Точное время старта",
-        value=f"<t:{timestamp}:F>\n(<t:{timestamp}:R>)",
-        inline=False
-    )
-
-    if started_by:
-        embed.add_field(
-            name="Запустил",
-            value=started_by,
-            inline=True
-        )
-
-    embed.set_footer(text="ZXC CS Servers • Обновляется автоматически")
-
-    return embed
-
-
-def build_finished_embed(title: str) -> discord.Embed:
-    """Embed когда таймер завершён"""
-    embed = discord.Embed(
-        title=f"{EMOJI_ROCKET}  {title}",
-        description=(
-            f"# Серверы запущены!\n\n"
-            f"{EMOJI_FIRE} **ZXC CS** онлайн\n"
-            f"Заходите и играйте!"
-        ),
-        color=COLOR_SUCCESS,
-        timestamp=datetime.now(timezone.utc)
-    )
-    embed.set_footer(text="ZXC CS Servers")
-    return embed
-
+# ==================== СОБЫТИЯ ====================
 
 @bot.event
 async def on_ready():
-    print(f"✅ Бот {bot.user} успешно запущен!")
-    print(f"📊 Серверов: {len(bot.guilds)}")
+    print(f"✅ Бот запущен как {bot.user}")
     try:
         synced = await bot.tree.sync()
         print(f"🔄 Синхронизировано команд: {len(synced)}")
     except Exception as e:
         print(f"❌ Ошибка синхронизации: {e}")
-    
-    if not update_timers.is_running():
-        update_timers.start()
 
 
-@bot.tree.command(name="таймер", description="Запустить красивый отсчёт до старта серверов ZXC")
+# ==================== КОМАНДЫ ====================
+
+@bot.tree.command(name="give_role", description="Выдать роль пользователю")
 @app_commands.describe(
-    дата="Дата в формате ДД.ММ.ГГГГ (пример: 05.10.2026)",
-    время="Время по МСК в формате ЧЧ:ММ (пример: 18:00)",
-    название="Название события (по умолчанию: Старт серверов ZXC)"
+    user="Кому выдать роль",
+    role="Какую роль выдать"
 )
-async def timer_command(
+@has_allowed_role()
+async def give_role(
     interaction: discord.Interaction,
-    дата: str,
-    время: str,
-    название: str = "Старт серверов ZXC CS"
+    user: discord.Member,
+    role: discord.Role
 ):
-    # Проверяем, есть ли уже таймер в канале
-    if interaction.channel_id in active_timers:
+    # Проверки иерархии
+    if role >= interaction.guild.me.top_role:
         await interaction.response.send_message(
-            f"{EMOJI_STOP} В этом канале уже есть активный таймер.\n"
-            f"Сначала останови его командой `/стоп_таймер`",
+            "❌ У бота недостаточно прав — роль выше или равна моей самой высокой роли.",
+            ephemeral=True
+        )
+        return
+
+    if role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message(
+            "❌ Ты не можешь выдавать роль выше или равную своей.",
+            ephemeral=True
+        )
+        return
+
+    if role in user.roles:
+        await interaction.response.send_message(
+            f"⚠️ У {user.mention} уже есть роль {role.mention}.",
             ephemeral=True
         )
         return
 
     try:
-        # Парсим дату и время по МСК
-        naive = datetime.strptime(f"{дата} {время}", "%d.%m.%Y %H:%M")
-        end_time = naive.replace(tzinfo=MSK).astimezone(timezone.utc)
-
-        now = datetime.now(timezone.utc)
-        if end_time <= now:
-            await interaction.response.send_message(
-                f"{EMOJI_STOP} Указанное время уже прошло!",
-                ephemeral=True
-            )
-            return
-
-        remaining = end_time - now
-        embed = build_embed(
-            название,
-            end_time,
-            remaining,
-            interaction.user.mention,
-            start_time=now
-        )
-
-        await interaction.response.send_message(embed=embed)
-        message = await interaction.original_response()
-
-        active_timers[interaction.channel_id] = {
-            "end_time": end_time,
-            "message": message,
-            "title": название,
-            "started_by": interaction.user.mention,
-            "start_time": now
-        }
-
-        await interaction.followup.send(
-            f"{EMOJI_CHECK} Таймер успешно запущен!",
-            ephemeral=True
-        )
-
-    except ValueError:
-        await interaction.response.send_message(
-            f"{EMOJI_STOP} **Неверный формат!**\n\n"
-            f"Правильно:\n"
-            f"`/таймер дата:05.10.2026 время:18:00`\n\n"
-            f"• Дата: `ДД.ММ.ГГГГ`\n"
-            f"• Время: `ЧЧ:ММ` (по московскому времени)",
-            ephemeral=True
-        )
-
-
-@bot.tree.command(name="стоп_таймер", description="Остановить активный таймер в этом канале")
-async def stop_timer(interaction: discord.Interaction):
-    if interaction.channel_id not in active_timers:
-        await interaction.response.send_message(
-            f"{EMOJI_STOP} В этом канале нет активного таймера.",
-            ephemeral=True
-        )
-        return
-
-    data = active_timers.pop(interaction.channel_id)
-    try:
+        await user.add_roles(role, reason=f"Выдано через бота пользователем {interaction.user}")
         embed = discord.Embed(
-            title=f"{EMOJI_STOP} Таймер остановлен",
-            description=f"**{data['title']}** был отменён.",
-            color=COLOR_ERROR
+            title="✅ Роль выдана",
+            description=f"Пользователю {user.mention} выдана роль {role.mention}",
+            color=discord.Color.green()
         )
-        await data["message"].edit(embed=embed)
-    except Exception:
-        pass
-
-    await interaction.response.send_message(
-        f"{EMOJI_CHECK} Таймер остановлен.",
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="статус", description="Показать информацию об активном таймере")
-async def status_command(interaction: discord.Interaction):
-    if interaction.channel_id not in active_timers:
+        embed.set_footer(text=f"Выдал: {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
         await interaction.response.send_message(
-            f"{EMOJI_STOP} В этом канале нет активного таймера.",
+            "❌ У бота нет прав на выдачу этой роли. Проверь права и иерархию ролей.",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="remove_role", description="Забрать роль у пользователя")
+@app_commands.describe(
+    user="У кого забрать роль",
+    role="Какую роль забрать"
+)
+@has_allowed_role()
+async def remove_role(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    role: discord.Role
+):
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "❌ У бота недостаточно прав — роль выше или равна моей самой высокой роли.",
             ephemeral=True
         )
         return
 
-    data = active_timers[interaction.channel_id]
-    remaining = data["end_time"] - datetime.now(timezone.utc)
+    if role >= interaction.user.top_role and interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message(
+            "❌ Ты не можешь забирать роль выше или равную своей.",
+            ephemeral=True
+        )
+        return
+
+    if role not in user.roles:
+        await interaction.response.send_message(
+            f"⚠️ У {user.mention} нет роли {role.mention}.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await user.remove_roles(role, reason=f"Забрано через бота пользователем {interaction.user}")
+        embed = discord.Embed(
+            title="✅ Роль забрана",
+            description=f"У пользователя {user.mention} забрана роль {role.mention}",
+            color=discord.Color.orange()
+        )
+        embed.set_footer(text=f"Забрал: {interaction.user.display_name}")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "❌ У бота нет прав на управление этой ролью.",
+            ephemeral=True
+        )
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
+@bot.tree.command(name="my_roles", description="Показать свои роли на сервере")
+async def my_roles(interaction: discord.Interaction):
+    roles = [role.mention for role in interaction.user.roles if role.name != "@everyone"]
     
-    embed = build_embed(
-        data["title"],
-        data["end_time"],
-        remaining,
-        data.get("started_by"),
-        data.get("start_time")
+    if not roles:
+        await interaction.response.send_message("У тебя пока нет ролей.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title=f"🎭 Роли {interaction.user.display_name}",
+        description="\n".join(roles),
+        color=discord.Color.blurple()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@tasks.loop(seconds=20)
-async def update_timers():
-    """Обновляет все активные таймеры"""
-    now = datetime.now(timezone.utc)
-    to_remove = []
+@bot.tree.command(name="user_roles", description="Показать роли другого пользователя")
+@app_commands.describe(user="Чьи роли посмотреть")
+async def user_roles(interaction: discord.Interaction, user: discord.Member):
+    roles = [role.mention for role in user.roles if role.name != "@everyone"]
+    
+    if not roles:
+        await interaction.response.send_message(
+            f"У {user.mention} пока нет ролей.",
+            ephemeral=True
+        )
+        return
 
-    for channel_id, data in list(active_timers.items()):
-        end_time: datetime = data["end_time"]
-        message: discord.Message = data["message"]
-        title: str = data["title"]
-        remaining = end_time - now
-
-        try:
-            if remaining.total_seconds() <= 0:
-                # Таймер закончился
-                finished = build_finished_embed(title)
-                await message.edit(embed=finished)
-
-                # Пингуем
-                try:
-                    await message.channel.send(
-                        f"{EMOJI_ROCKET} @everyone\n"
-                        f"**{title}** — серверы **ZXC** запущены! {EMOJI_FIRE}\n"
-                        f"Залетайте играть!"
-                    )
-                except discord.Forbidden:
-                    # Нет прав на mention everyone
-                    await message.channel.send(
-                        f"{EMOJI_ROCKET} **{title}** — серверы **ZXC** запущены! {EMOJI_FIRE}"
-                    )
-
-                to_remove.append(channel_id)
-            else:
-                # Обновляем embed
-                embed = build_embed(
-                    title,
-                    end_time,
-                    remaining,
-                    data.get("started_by"),
-                    data.get("start_time")
-                )
-                await message.edit(embed=embed)
-
-        except discord.NotFound:
-            # Сообщение удалили
-            to_remove.append(channel_id)
-        except discord.Forbidden:
-            to_remove.append(channel_id)
-        except Exception as e:
-            print(f"Ошибка обновления таймера в канале {channel_id}: {e}")
-
-    for cid in to_remove:
-        active_timers.pop(cid, None)
+    embed = discord.Embed(
+        title=f"🎭 Роли {user.display_name}",
+        description="\n".join(roles),
+        color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(embed=embed)
 
 
-@update_timers.before_loop
-async def before_update():
-    await bot.wait_until_ready()
+# ==================== ОБРАБОТКА ОШИБОК ====================
 
+@give_role.error
+@remove_role.error
+async def role_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        await interaction.response.send_message(
+            "❌ У тебя нет доступа к этой команде.\n"
+            "Нужна одна из специальных ролей.",
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            f"❌ Произошла ошибка: {error}",
+            ephemeral=True
+        )
+
+
+# ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
     if not TOKEN:
